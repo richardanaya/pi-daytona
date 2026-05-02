@@ -1,9 +1,13 @@
 /**
- * pi-daytona — Daytona Cloud Sandbox Extension
+ * pi-daytona — Daytona Cloud Sandbox Extension (v0.0.1)
  *
  * Overrides pi's core filesystem and execution tools (read, write, edit,
  * bash, grep, find, ls) so all operations run inside an isolated Daytona
  * sandbox instead of the local machine.
+ *
+ * v0.0.1: Per-session sandbox state — supports concurrent sessions
+ * (e.g., HTTP server with multiple clients) by keying sandbox state
+ * on sessionManager.getSessionId() instead of module globals.
  *
  * Usage:
  *   pi --sandbox my-sandbox          # connect to existing or create named sandbox
@@ -20,6 +24,7 @@ import { readFile, access } from "node:fs/promises";
 import { Daytona, type Sandbox } from "@daytonaio/sdk";
 import type {
 	ExtensionAPI,
+	ExtensionContext,
 	BashOperations,
 	ReadOperations,
 	WriteOperations,
@@ -46,7 +51,15 @@ interface SandboxConfig {
 	sandboxId?: string;
 }
 
-// ── State ───────────────────────────────────────────────────────────────────
+/** Per-session sandbox state, keyed by sessionManager.getSessionId(). */
+interface SessionState {
+	sandbox: Sandbox;
+	workDir: string;
+	cwd: string;
+	enabled: boolean;
+}
+
+// ── Constants ───────────────────────────────────────────────────────────────
 
 const PI_DAYTONA_LABEL = { "created-by": "pi-daytona" };
 const PI_DAYTONA_PREFIX = "pi-daytona-";
@@ -59,12 +72,15 @@ function randomSuffix(): string {
 	return Math.random().toString(36).slice(2, 8);
 }
 
+// ── Shared state ────────────────────────────────────────────────────────────
+
+/** Daytona API client — stateless, shared across all sessions. */
 let daytona: Daytona | null = null;
-let sandbox: Sandbox | null = null;
-let sandboxWorkDir = "/home/daytona/workspace";
-let localCwd = process.cwd();
+
+/** Per-session sandbox state: sessionId → { sandbox, workDir, cwd, enabled } */
+const sessions = new Map<string, SessionState>();
+
 let configPath: string;
-let sandboxEnabled = false;
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -78,45 +94,51 @@ async function loadConfig(): Promise<SandboxConfig> {
 	}
 }
 
-// ── Path Mapping ────────────────────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
-function toSandboxPath(absolutePath: string): string {
-	if (absolutePath.startsWith(localCwd)) {
-		const relative = absolutePath.slice(localCwd.length);
-		// Ensure no double slashes
+/** Look up per-session state from an ExtensionContext. */
+function getState(ctx: ExtensionContext): SessionState | undefined {
+	return sessions.get(ctx.sessionManager.getSessionId());
+}
+
+/** Get the session's sandbox (throws if not active). */
+function requireState(ctx: ExtensionContext): SessionState {
+	const state = getState(ctx);
+	if (!state?.enabled || !state.sandbox) {
+		throw new Error("Sandbox not active for this session");
+	}
+	return state;
+}
+
+// ── Path Mapping (per-session) ──────────────────────────────────────────────
+
+function toSandboxPath(state: SessionState, absolutePath: string): string {
+	if (absolutePath.startsWith(state.cwd)) {
+		const relative = absolutePath.slice(state.cwd.length);
 		const clean = relative.startsWith("/") ? relative : "/" + relative;
-		return sandboxWorkDir + clean;
+		return state.workDir + clean;
 	}
 	// Already within sandbox or absolute sandbox path – pass through
 	return absolutePath;
 }
 
-// ── Sandbox Operations Factories ────────────────────────────────────────────
+// ── Sandbox Operations Factories (per-session) ──────────────────────────────
 
-function createSandboxReadOps(): ReadOperations {
-	const s = sandbox!;
+function createSandboxReadOps(state: SessionState): ReadOperations {
+	const s = state.sandbox;
 	return {
 		readFile: async (absolutePath: string): Promise<Buffer> => {
-			return s.fs.downloadFile(toSandboxPath(absolutePath));
+			return s.fs.downloadFile(toSandboxPath(state, absolutePath));
 		},
 		access: async (absolutePath: string): Promise<void> => {
-			// getFileDetails throws if not found / not accessible
-			await s.fs.getFileDetails(toSandboxPath(absolutePath));
+			await s.fs.getFileDetails(toSandboxPath(state, absolutePath));
 		},
-		detectImageMimeType: async (
-			absolutePath: string,
-		): Promise<string | null | undefined> => {
+		detectImageMimeType: async (absolutePath: string): Promise<string | null | undefined> => {
 			try {
-				const sp = toSandboxPath(absolutePath);
-				const result = await s.process.executeCommand(
-					`file --mime-type -b "${sp}"`,
-				);
+				const sp = toSandboxPath(state, absolutePath);
+				const result = await s.process.executeCommand(`file --mime-type -b "${sp}"`);
 				const mime = result.result.trim();
-				return ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(
-					mime,
-				)
-					? mime
-					: null;
+				return ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mime) ? mime : null;
 			} catch {
 				return null;
 			}
@@ -124,63 +146,45 @@ function createSandboxReadOps(): ReadOperations {
 	};
 }
 
-function createSandboxWriteOps(): WriteOperations {
-	const s = sandbox!;
+function createSandboxWriteOps(state: SessionState): WriteOperations {
+	const s = state.sandbox;
 	return {
 		writeFile: async (absolutePath: string, content: string): Promise<void> => {
-			await s.fs.uploadFile(
-				Buffer.from(content, "utf-8"),
-				toSandboxPath(absolutePath),
-			);
+			await s.fs.uploadFile(Buffer.from(content, "utf-8"), toSandboxPath(state, absolutePath));
 		},
 		mkdir: async (dir: string): Promise<void> => {
-			await s.fs.createFolder(toSandboxPath(dir), "755");
+			await s.fs.createFolder(toSandboxPath(state, dir), "755");
 		},
 	};
 }
 
-function createSandboxEditOps(): EditOperations {
-	const s = sandbox!;
+function createSandboxEditOps(state: SessionState): EditOperations {
+	const s = state.sandbox;
 	return {
 		readFile: async (absolutePath: string): Promise<Buffer> => {
-			return s.fs.downloadFile(toSandboxPath(absolutePath));
+			return s.fs.downloadFile(toSandboxPath(state, absolutePath));
 		},
 		writeFile: async (absolutePath: string, content: string): Promise<void> => {
-			await s.fs.uploadFile(
-				Buffer.from(content, "utf-8"),
-				toSandboxPath(absolutePath),
-			);
+			await s.fs.uploadFile(Buffer.from(content, "utf-8"), toSandboxPath(state, absolutePath));
 		},
 		access: async (absolutePath: string): Promise<void> => {
-			await s.fs.getFileDetails(toSandboxPath(absolutePath));
+			await s.fs.getFileDetails(toSandboxPath(state, absolutePath));
 		},
 	};
 }
 
-function createSandboxBashOps(): BashOperations {
-	const s = sandbox!;
+function createSandboxBashOps(state: SessionState): BashOperations {
+	const s = state.sandbox;
 	return {
 		exec: async (command, cwd, { onData, signal, timeout, env }) => {
-			if (signal?.aborted) {
-				throw new Error("Operation aborted");
-			}
+			if (signal?.aborted) throw new Error("Operation aborted");
 
-			// Map local cwd to sandbox cwd
-			const sandboxCwd = cwd ? toSandboxPath(cwd) : sandboxWorkDir;
+			const sandboxCwd = cwd ? toSandboxPath(state, cwd) : state.workDir;
 
 			try {
-				// Daytona executeCommand doesn't stream back stdout progressively,
-				// so we collect the full result and emit it once.
-				const result = await s.process.executeCommand(
-					command,
-					sandboxCwd,
-					env,
-					timeout,
-				);
+				const result = await s.process.executeCommand(command, sandboxCwd, env, timeout);
 
-				if (signal?.aborted) {
-					throw new Error("Operation aborted");
-				}
+				if (signal?.aborted) throw new Error("Operation aborted");
 
 				if (result.result) {
 					onData(Buffer.from(result.result, "utf-8"));
@@ -188,94 +192,59 @@ function createSandboxBashOps(): BashOperations {
 
 				return { exitCode: result.exitCode };
 			} catch (err: any) {
-				if (signal?.aborted) {
-					throw new Error("Operation aborted");
-				}
-				// Daytona errors often include the exit code and output in the message
+				if (signal?.aborted) throw new Error("Operation aborted");
 				const exitCodeMatch = err?.message?.match(/exit code (\d+)/i);
-				const exitCode = exitCodeMatch
-					? Number.parseInt(exitCodeMatch[1], 10)
-					: 1;
-				return { exitCode };
+				return { exitCode: exitCodeMatch ? Number.parseInt(exitCodeMatch[1], 10) : 1 };
 			}
 		},
 	};
 }
 
-// ── Tool factories (lazily create with sandbox ops) ─────────────────────────
+// ── Tool builders (per-session) ─────────────────────────────────────────────
 
-function buildReadTool() {
-	return createReadTool(localCwd, { operations: createSandboxReadOps() });
+function buildReadTool(state: SessionState) {
+	return createReadTool(state.cwd, { operations: createSandboxReadOps(state) });
 }
 
-function buildWriteTool() {
-	return createWriteTool(localCwd, { operations: createSandboxWriteOps() });
+function buildWriteTool(state: SessionState) {
+	return createWriteTool(state.cwd, { operations: createSandboxWriteOps(state) });
 }
 
-function buildEditTool() {
-	return createEditTool(localCwd, { operations: createSandboxEditOps() });
+function buildEditTool(state: SessionState) {
+	return createEditTool(state.cwd, { operations: createSandboxEditOps(state) });
 }
 
-function buildBashTool() {
-	return createBashTool(localCwd, { operations: createSandboxBashOps() });
+function buildBashTool(state: SessionState) {
+	return createBashTool(state.cwd, { operations: createSandboxBashOps(state) });
 }
 
-// ── Helpers for grep/find/ls (full tool replacement) ────────────────────────
+// ── Formatting helpers ──────────────────────────────────────────────────────
 
-/**
- * Format matches from Daytona's findFiles (text-in-files search) into
- * a grep-like output string.
- */
 function formatGrepMatches(
 	matches: Array<{ file: string; line: number; content: string }>,
 	limit: number,
 ): string {
-	if (matches.length === 0) {
-		return "(no matches)";
-	}
+	if (matches.length === 0) return "(no matches)";
 	const capped = matches.slice(0, limit);
-	const lines = capped.map(
-		(m) => `${m.file}:${m.line}: ${m.content}`,
-	);
+	const lines = capped.map((m) => `${m.file}:${m.line}: ${m.content}`);
 	let output = lines.join("\n");
-	if (matches.length > limit) {
-		output += `\n\n[${matches.length - limit} more matches truncated, limit=${limit}]`;
-	}
+	if (matches.length > limit) output += `\n\n[${matches.length - limit} more matches truncated, limit=${limit}]`;
 	return output;
 }
 
-/**
- * Format files from Daytona's searchFiles (name pattern search) into
- * a find-like output string.
- */
 function formatFindResults(files: string[], limit: number): string {
-	if (files.length === 0) {
-		return "(no files found)";
-	}
+	if (files.length === 0) return "(no files found)";
 	const capped = files.slice(0, limit);
 	let output = capped.join("\n");
-	if (files.length > limit) {
-		output += `\n\n[${files.length - limit} more results truncated, limit=${limit}]`;
-	}
+	if (files.length > limit) output += `\n\n[${files.length - limit} more results truncated, limit=${limit}]`;
 	return output;
 }
 
-/**
- * Format FileInfo entries into an ls-like output string.
- */
 function formatLsResults(
-	files: Array<{
-		name: string;
-		isDir: boolean;
-		size: number;
-		modTime: string;
-		permissions: string;
-	}>,
+	files: Array<{ name: string; isDir: boolean; size: number; modTime: string; permissions: string }>,
 	limit: number,
 ): string {
-	if (files.length === 0) {
-		return "(empty directory)";
-	}
+	if (files.length === 0) return "(empty directory)";
 	const capped = files.slice(0, limit);
 	const lines = capped.map((f) => {
 		const type = f.isDir ? "d" : "-";
@@ -284,9 +253,7 @@ function formatLsResults(
 		return `${type}${f.permissions || "---------"}  ${size}  ${mod}  ${f.name}${f.isDir ? "/" : ""}`;
 	});
 	let output = lines.join("\n");
-	if (files.length > limit) {
-		output += `\n\n[${files.length - limit} more entries truncated, limit=${limit}]`;
-	}
+	if (files.length > limit) output += `\n\n[${files.length - limit} more entries truncated, limit=${limit}]`;
 	return output;
 }
 
@@ -298,8 +265,7 @@ export default async function (pi: ExtensionAPI) {
 	// ── Register CLI flags ───────────────────────────────────────────────
 
 	pi.registerFlag("sandbox", {
-		description:
-			"Daytona sandbox ID/name to use (creates one if not found). Omit value to auto-create.",
+		description: "Daytona sandbox ID/name to use (creates one if not found). Omit value to auto-create.",
 		type: "string",
 	});
 
@@ -309,103 +275,106 @@ export default async function (pi: ExtensionAPI) {
 		default: false,
 	});
 
+	// ── Local fallback tools (cwd resolved at call time via ctx) ──────────
+
+	const defaultCwd = process.cwd();
+	const localRead = createReadTool(defaultCwd);
+	const localWrite = createWriteTool(defaultCwd);
+	const localEdit = createEditTool(defaultCwd);
+	const localBash = createBashTool(defaultCwd);
+
 	// ── Register sandboxed tools (overrides built-in) ────────────────────
 
-	// Save original built-in tools for fallback
-	const localRead = createReadTool(localCwd);
-	const localWrite = createWriteTool(localCwd);
-	const localEdit = createEditTool(localCwd);
-	const localBash = createBashTool(localCwd);
-
-	// read – override with sandbox-aware execute
+	// read
 	pi.registerTool({
 		...localRead,
 		label: "read (sandboxed)",
-		async execute(id, params, signal, onUpdate, _ctx) {
-			if (!sandboxEnabled || !sandbox) {
+		async execute(id, params, signal, onUpdate, ctx) {
+			const state = getState(ctx as ExtensionContext);
+			if (!state?.enabled || !state.sandbox) {
 				return localRead.execute(id, params, signal, onUpdate);
 			}
-			return buildReadTool().execute(id, params, signal, onUpdate);
+			return buildReadTool(state).execute(id, params, signal, onUpdate);
 		},
 	});
 
-	// write – override with sandbox-aware execute
+	// write
 	pi.registerTool({
 		...localWrite,
 		label: "write (sandboxed)",
-		async execute(id, params, signal, onUpdate, _ctx) {
-			if (!sandboxEnabled || !sandbox) {
+		async execute(id, params, signal, onUpdate, ctx) {
+			const state = getState(ctx as ExtensionContext);
+			if (!state?.enabled || !state.sandbox) {
 				return localWrite.execute(id, params, signal, onUpdate);
 			}
-			return buildWriteTool().execute(id, params, signal, onUpdate);
+			return buildWriteTool(state).execute(id, params, signal, onUpdate);
 		},
 	});
 
-	// edit – override with sandbox-aware execute
+	// edit
 	pi.registerTool({
 		...localEdit,
 		label: "edit (sandboxed)",
-		async execute(id, params, signal, onUpdate, _ctx) {
-			if (!sandboxEnabled || !sandbox) {
+		async execute(id, params, signal, onUpdate, ctx) {
+			const state = getState(ctx as ExtensionContext);
+			if (!state?.enabled || !state.sandbox) {
 				return localEdit.execute(id, params, signal, onUpdate);
 			}
-			return buildEditTool().execute(id, params, signal, onUpdate);
+			return buildEditTool(state).execute(id, params, signal, onUpdate);
 		},
 	});
 
-	// bash – override with sandbox-aware execute
+	// bash
 	pi.registerTool({
 		...localBash,
 		label: "bash (sandboxed)",
-		async execute(id, params, signal, onUpdate, _ctx) {
-			if (!sandboxEnabled || !sandbox) {
+		async execute(id, params, signal, onUpdate, ctx) {
+			const state = getState(ctx as ExtensionContext);
+			if (!state?.enabled || !state.sandbox) {
 				return localBash.execute(id, params, signal, onUpdate);
 			}
-			return buildBashTool().execute(id, params, signal, onUpdate);
+			return buildBashTool(state).execute(id, params, signal, onUpdate);
 		},
 	});
 
-	// grep – override with Daytona-native findFiles
-	const grepSchema = Type.Object({
-		pattern: Type.String({ description: "Search pattern (regex or literal string)" }),
-		path: Type.Optional(Type.String({ description: "Directory or file to search (default: current directory)" })),
-		glob: Type.Optional(Type.String({ description: "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'" })),
-		ignoreCase: Type.Optional(Type.Boolean({ description: "Case-insensitive search (default: false)" })),
-		literal: Type.Optional(Type.Boolean({ description: "Treat pattern as literal string instead of regex (default: false)" })),
-		context: Type.Optional(Type.Number({ description: "Number of lines to show before and after each match (default: 0)" })),
-		limit: Type.Optional(Type.Number({ description: "Maximum number of matches to return (default: 100)" })),
-	});
-
+	// grep
 	pi.registerTool({
 		name: "grep",
 		label: "grep (sandboxed)",
-		description:
-			"Search for a pattern in files within the Daytona sandbox. Returns matching lines with file path, line number, and content.",
+		description: "Search for a pattern in files within the Daytona sandbox. Returns matching lines with file path, line number, and content.",
 		promptSnippet: "Search file contents with regex",
 		promptGuidelines: ["Use grep to search for patterns in code instead of terminal grep/rg."],
-		parameters: grepSchema,
+		parameters: Type.Object({
+			pattern: Type.String({ description: "Search pattern (regex or literal string)" }),
+			path: Type.Optional(Type.String({ description: "Directory or file to search (default: current directory)" })),
+			glob: Type.Optional(Type.String({ description: "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'" })),
+			ignoreCase: Type.Optional(Type.Boolean({ description: "Case-insensitive search (default: false)" })),
+			literal: Type.Optional(Type.Boolean({ description: "Treat pattern as literal string instead of regex (default: false)" })),
+			context: Type.Optional(Type.Number({ description: "Number of lines to show before and after each match (default: 0)" })),
+			limit: Type.Optional(Type.Number({ description: "Maximum number of matches to return (default: 100)" })),
+		}),
 		async execute(
-			_toolCallId,
+			toolCallId,
 			params: { pattern: string; path?: string; glob?: string; ignoreCase?: boolean; literal?: boolean; context?: number; limit?: number },
-			_signal,
-			_onUpdate,
-			_ctx,
+			signal,
+			onUpdate,
+			ctx,
 		) {
-			if (!sandboxEnabled || !sandbox) {
-				const localGrep = createGrepTool(localCwd);
-				return localGrep.execute(_toolCallId, params, _signal, _onUpdate);
+			const state = getState(ctx as ExtensionContext);
+			if (!state?.enabled || !state.sandbox) {
+				const localGrep = createGrepTool(defaultCwd);
+				return localGrep.execute(toolCallId, params, signal, onUpdate);
 			}
-			const s = sandbox!;
+			const s = state.sandbox;
 			const searchPath = params.path
-				? toSandboxPath(params.path.startsWith("/") ? params.path : join(localCwd, params.path))
-				: toSandboxPath(localCwd);
+				? toSandboxPath(state, params.path.startsWith("/") ? params.path : join(state.cwd, params.path))
+				: toSandboxPath(state, state.cwd);
 			const limit = params.limit ?? 100;
 
 			try {
 				const matches = await s.fs.findFiles(searchPath, params.pattern);
-				const output = formatGrepMatches(matches, limit);
 				return {
-					content: [{ type: "text" as const, text: output }],
+					content: [{ type: "text" as const, text: formatGrepMatches(matches, limit) }],
 					details: { matchCount: matches.length },
 				};
 			} catch (err: any) {
@@ -417,45 +386,40 @@ export default async function (pi: ExtensionAPI) {
 		},
 	});
 
-	// find – override with Daytona-native searchFiles
-	const findSchema = Type.Object({
-		pattern: Type.String({
-			description: "Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'",
-		}),
-		path: Type.Optional(Type.String({ description: "Directory to search in (default: current directory)" })),
-		limit: Type.Optional(Type.Number({ description: "Maximum number of results (default: 1000)" })),
-	});
-
+	// find
 	pi.registerTool({
 		name: "find",
 		label: "find (sandboxed)",
-		description:
-			"Find files matching a glob pattern within the Daytona sandbox. Returns matching file paths.",
+		description: "Find files matching a glob pattern within the Daytona sandbox. Returns matching file paths.",
 		promptSnippet: "Find files by glob pattern",
 		promptGuidelines: ["Use find to search for files by name instead of shell find or fd."],
-		parameters: findSchema,
+		parameters: Type.Object({
+			pattern: Type.String({ description: "Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'" }),
+			path: Type.Optional(Type.String({ description: "Directory to search in (default: current directory)" })),
+			limit: Type.Optional(Type.Number({ description: "Maximum number of results (default: 1000)" })),
+		}),
 		async execute(
-			_toolCallId,
+			toolCallId,
 			params: { pattern: string; path?: string; limit?: number },
-			_signal,
-			_onUpdate,
-			_ctx,
+			signal,
+			onUpdate,
+			ctx,
 		) {
-			if (!sandboxEnabled || !sandbox) {
-				const localFind = createFindTool(localCwd);
-				return localFind.execute(_toolCallId, params, _signal, _onUpdate);
+			const state = getState(ctx as ExtensionContext);
+			if (!state?.enabled || !state.sandbox) {
+				const localFind = createFindTool(defaultCwd);
+				return localFind.execute(toolCallId, params, signal, onUpdate);
 			}
-			const s = sandbox!;
+			const s = state.sandbox;
 			const searchPath = params.path
-				? toSandboxPath(params.path.startsWith("/") ? params.path : join(localCwd, params.path))
-				: toSandboxPath(localCwd);
+				? toSandboxPath(state, params.path.startsWith("/") ? params.path : join(state.cwd, params.path))
+				: toSandboxPath(state, state.cwd);
 			const limit = params.limit ?? 1000;
 
 			try {
 				const result = await s.fs.searchFiles(searchPath, params.pattern);
-				const output = formatFindResults(result.files, limit);
 				return {
-					content: [{ type: "text" as const, text: output }],
+					content: [{ type: "text" as const, text: formatFindResults(result.files, limit) }],
 					details: { fileCount: result.files.length },
 				};
 			} catch (err: any) {
@@ -467,42 +431,39 @@ export default async function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ls – override with Daytona-native listFiles
-	const lsSchema = Type.Object({
-		path: Type.Optional(Type.String({ description: "Directory to list (default: current directory)" })),
-		limit: Type.Optional(Type.Number({ description: "Maximum number of entries to return (default: 500)" })),
-	});
-
+	// ls
 	pi.registerTool({
 		name: "ls",
 		label: "ls (sandboxed)",
-		description:
-			"List files and directories within the Daytona sandbox. Returns file names with type, size, and permissions.",
+		description: "List files and directories within the Daytona sandbox. Returns file names with type, size, and permissions.",
 		promptSnippet: "List directory contents",
 		promptGuidelines: ["Use ls to list directory contents instead of shell ls."],
-		parameters: lsSchema,
+		parameters: Type.Object({
+			path: Type.Optional(Type.String({ description: "Directory to list (default: current directory)" })),
+			limit: Type.Optional(Type.Number({ description: "Maximum number of entries to return (default: 500)" })),
+		}),
 		async execute(
-			_toolCallId,
+			toolCallId,
 			params: { path?: string; limit?: number },
-			_signal,
-			_onUpdate,
-			_ctx,
+			signal,
+			onUpdate,
+			ctx,
 		) {
-			if (!sandboxEnabled || !sandbox) {
-				const localLs = createLsTool(localCwd);
-				return localLs.execute(_toolCallId, params, _signal, _onUpdate);
+			const state = getState(ctx as ExtensionContext);
+			if (!state?.enabled || !state.sandbox) {
+				const localLs = createLsTool(defaultCwd);
+				return localLs.execute(toolCallId, params, signal, onUpdate);
 			}
-			const s = sandbox!;
+			const s = state.sandbox;
 			const listPath = params.path
-				? toSandboxPath(params.path.startsWith("/") ? params.path : join(localCwd, params.path))
-				: toSandboxPath(localCwd);
+				? toSandboxPath(state, params.path.startsWith("/") ? params.path : join(state.cwd, params.path))
+				: toSandboxPath(state, state.cwd);
 			const limit = params.limit ?? 500;
 
 			try {
 				const files = await s.fs.listFiles(listPath);
-				const output = formatLsResults(files, limit);
 				return {
-					content: [{ type: "text" as const, text: output }],
+					content: [{ type: "text" as const, text: formatLsResults(files, limit) }],
 					details: { entryCount: files.length },
 				};
 			} catch (err: any) {
@@ -516,18 +477,20 @@ export default async function (pi: ExtensionAPI) {
 
 	// ── Handle user ! commands via sandbox ───────────────────────────────
 
-	pi.on("user_bash", () => {
-		if (!sandboxEnabled || !sandbox) return;
-		return { operations: createSandboxBashOps() };
+	pi.on("user_bash", (_event, ctx) => {
+		const state = getState(ctx);
+		if (!state?.enabled || !state.sandbox) return;
+		return { operations: createSandboxBashOps(state) };
 	});
 
 	// ── Update system prompt to reflect sandbox working directory ────────
 
-	pi.on("before_agent_start", async (event) => {
-		if (sandboxEnabled && sandbox) {
+	pi.on("before_agent_start", async (event, ctx) => {
+		const state = getState(ctx);
+		if (state?.enabled && state.sandbox) {
 			const modified = event.systemPrompt.replace(
-				`Current working directory: ${localCwd}`,
-				`Current working directory: ${sandboxWorkDir} (Daytona sandbox: ${sandbox.id})`,
+				`Current working directory: ${state.cwd}`,
+				`Current working directory: ${state.workDir} (Daytona sandbox: ${state.sandbox.id})`,
 			);
 			return { systemPrompt: modified };
 		}
@@ -536,9 +499,15 @@ export default async function (pi: ExtensionAPI) {
 	// ── Session start: initialize Daytona sandbox ────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
+		const sessionId = ctx.sessionManager.getSessionId();
+
+		// Check if this session already has sandbox state (e.g., on reload)
+		if (sessions.has(sessionId)) {
+			return;
+		}
+
 		const noSandbox = pi.getFlag("no-sandbox") as boolean;
 		if (noSandbox) {
-			sandboxEnabled = false;
 			ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
 			return;
 		}
@@ -547,21 +516,16 @@ export default async function (pi: ExtensionAPI) {
 		const apiKey = config.daytonaApiKey;
 
 		if (!apiKey) {
-			sandboxEnabled = false;
 			ctx.ui.notify(
-				"Sandbox config not found. Create ~/.pi/daytona.json with { \"daytonaApiKey\": \"dtn_...\" }",
+				'Sandbox config not found. Create ~/.pi/daytona.json with { "daytonaApiKey": "dtn_..." }',
 				"warning",
 			);
 			return;
 		}
 
-		// Update local cwd (may change on session reload)
-		localCwd = ctx.cwd;
-
 		// Only activate sandbox when --sandbox flag is explicitly passed
 		const sandboxFlag = pi.getFlag("sandbox") as string | undefined;
 		if (sandboxFlag === undefined) {
-			sandboxEnabled = false;
 			ctx.ui.notify(
 				"Sandbox mode not active. Use --sandbox <id> to connect, or --sandbox to auto-create.",
 				"info",
@@ -570,13 +534,17 @@ export default async function (pi: ExtensionAPI) {
 		}
 
 		try {
-			daytona = new Daytona({
-				apiKey,
-				apiUrl: config.daytonaApiUrl || "https://app.daytona.io/api",
-				target: config.daytonaTarget || "us",
-			});
+			// Lazy-init shared Daytona client
+			if (!daytona) {
+				daytona = new Daytona({
+					apiKey,
+					apiUrl: config.daytonaApiUrl || "https://app.daytona.io/api",
+					target: config.daytonaTarget || "us",
+				});
+			}
 
-			// Use flag value if non-empty, otherwise fall back to config.sandboxId
+			const cwd = ctx.cwd;
+			let sandbox: Sandbox;
 			const rawName = sandboxFlag || config.sandboxId;
 
 			if (rawName) {
@@ -584,79 +552,65 @@ export default async function (pi: ExtensionAPI) {
 				let found: Sandbox | null = null;
 				for (const candidate of [rawName, prefixedName(rawName)]) {
 					try {
-						found = await daytona.get(candidate);
+						found = await daytona!.get(candidate);
 						break;
-					} catch { /* not found, try next */ }
+					} catch {
+						/* not found, try next */
+					}
 				}
 
 				if (found) {
 					sandbox = found;
-					ctx.ui.notify(
-						`Connected to existing sandbox: ${sandbox.id} (${sandbox.name || sandbox.id})`,
-						"info",
-					);
+					ctx.ui.notify(`Connected to existing sandbox: ${sandbox.id} (${sandbox.name || sandbox.id})`, "info");
 				} else {
-					// Not found, create a new one with the prefixed name
 					const name = prefixedName(rawName);
-					ctx.ui.notify(
-						`Sandbox "${rawName}" not found, creating "${name}"...`,
-						"info",
-					);
-					sandbox = await daytona.create(
-						{
-							name,
-							language: "typescript" as any,
-							labels: PI_DAYTONA_LABEL,
-						},
+					ctx.ui.notify(`Sandbox "${rawName}" not found, creating "${name}"...`, "info");
+					sandbox = await daytona!.create(
+						{ name, language: "typescript" as any, labels: PI_DAYTONA_LABEL },
 						{ timeout: 120 },
 					);
-					ctx.ui.notify(
-						`Created sandbox: ${sandbox.id} (${name})`,
-						"info",
-					);
+					ctx.ui.notify(`Created sandbox: ${sandbox.id} (${name})`, "info");
 				}
 			} else {
-				// --sandbox passed without a value and no config fallback → auto-create
+				// Auto-create
 				const name = PI_DAYTONA_PREFIX + randomSuffix();
 				ctx.ui.notify(`Creating Daytona sandbox "${name}"...`, "info");
-				sandbox = await daytona.create(
-					{
-						name,
-						language: "typescript" as any,
-						autoStopInterval: 30,
-						labels: PI_DAYTONA_LABEL,
-					},
+				sandbox = await daytona!.create(
+					{ name, language: "typescript" as any, autoStopInterval: 30, labels: PI_DAYTONA_LABEL },
 					{ timeout: 120 },
 				);
 				ctx.ui.notify(`Created sandbox: ${sandbox.id} (${name})`, "info");
 			}
 
 			// Resolve sandbox working directory
+			let workDir = "/home/daytona/workspace";
 			try {
 				const wd = await sandbox.getWorkDir();
-				if (wd) sandboxWorkDir = wd;
+				if (wd) workDir = wd;
 			} catch {
 				// Fall back to default
 			}
 
-			sandboxEnabled = true;
+			// Store per-session state
+			sessions.set(sessionId, { sandbox, workDir, cwd, enabled: true });
 
-			ctx.ui.setStatus(
-				"sandbox",
-				ctx.ui.theme.fg("accent", `🏖️ Sandbox: ${sandbox.name || sandbox.id}`),
-			);
+			ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", `🏖️ Sandbox: ${sandbox.name || sandbox.id}`));
 		} catch (err: any) {
-			sandboxEnabled = false;
-			ctx.ui.notify(
-				`Sandbox initialization failed: ${err.message}`,
-				"error",
-			);
+			ctx.ui.notify(`Sandbox initialization failed: ${err.message}`, "error");
 		}
 	});
 
-	// ── Register sandbox-list tool (LLM-callable) ────────────────────────
+	// ── Session shutdown: clean up if session is being replaced/ended ────
 
-	const sandboxListSchema = Type.Object({});
+	pi.on("session_shutdown", async (_event, ctx) => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		// Keep the sandbox alive (don't delete), just remove our local state.
+		// Sandboxes auto-stop after idle timeout. Users can explicitly delete
+		// via sandbox-delete.
+		sessions.delete(sessionId);
+	});
+
+	// ── sandbox-list tool ────────────────────────────────────────────────
 
 	pi.registerTool({
 		name: "sandbox-list",
@@ -667,17 +621,14 @@ export default async function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use sandbox-list to see what sandboxes exist before switching or deleting.",
 		],
-		parameters: sandboxListSchema,
+		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
 			if (!daytona) {
 				const config = await loadConfig();
 				if (!config.daytonaApiKey) {
 					return {
 						content: [
-							{
-								type: "text" as const,
-								text: "Not connected to Daytona. Set daytonaApiKey in ~/.pi/daytona.json",
-							},
+							{ type: "text" as const, text: "Not connected to Daytona. Set daytonaApiKey in ~/.pi/daytona.json" },
 						],
 					};
 				}
@@ -691,17 +642,23 @@ export default async function (pi: ExtensionAPI) {
 			try {
 				const result = await daytona.list(PI_DAYTONA_LABEL);
 				if (result.items.length === 0) {
-					return {
-						content: [{ type: "text" as const, text: "No pi-managed sandboxes found." }],
-					};
+					return { content: [{ type: "text" as const, text: "No pi-managed sandboxes found." }] };
+				}
+
+				// Collect active sandbox IDs across all sessions
+				const activeIds = new Set<string>();
+				for (const state of sessions.values()) {
+					if (state.enabled && state.sandbox) {
+						activeIds.add(state.sandbox.id);
+					}
 				}
 
 				const lines = [`pi-managed sandboxes (${result.items.length}):`, ""];
 				for (const sb of result.items) {
-					const marker = sandbox?.id === sb.id ? " ◀ active" : "";
+					const marker = activeIds.has(sb.id) ? " ◀ active" : "";
 					const name = sb.name || "(unnamed)";
-					const state = sb.state || "?";
-					lines.push(`  ${name}  [${sb.id}]  (${state})${marker}`);
+					const st = sb.state || "?";
+					lines.push(`  ${name}  [${sb.id}]  (${st})${marker}`);
 				}
 				return {
 					content: [{ type: "text" as const, text: lines.join("\n") }],
@@ -709,22 +666,13 @@ export default async function (pi: ExtensionAPI) {
 				};
 			} catch (err: any) {
 				return {
-					content: [
-						{ type: "text" as const, text: `Failed to list sandboxes: ${err.message}` },
-					],
+					content: [{ type: "text" as const, text: `Failed to list sandboxes: ${err.message}` }],
 				};
 			}
 		},
 	});
 
-	// ── Register sandbox-delete tool (LLM-callable) ──────────────────────
-
-	const sandboxDeleteSchema = Type.Object({
-		sandboxIds: Type.Array(Type.String(), {
-			description:
-				"One or more sandbox IDs or names to delete. If empty, deletes the currently active sandbox. Use sandbox-list first to find IDs.",
-		}),
-	});
+	// ── sandbox-delete tool ──────────────────────────────────────────────
 
 	pi.registerTool({
 		name: "sandbox-delete",
@@ -736,19 +684,21 @@ export default async function (pi: ExtensionAPI) {
 			"Use sandbox-list before sandbox-delete to confirm which sandboxes to remove.",
 			"Deleting the active sandbox will detach pi and switch back to local tools.",
 		],
-		parameters: sandboxDeleteSchema,
+		parameters: Type.Object({
+			sandboxIds: Type.Array(Type.String(), {
+				description: "One or more sandbox IDs or names to delete. If empty, deletes the currently active sandbox. Use sandbox-list first to find IDs.",
+			}),
+		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const { sandboxIds } = params as { sandboxIds: string[] };
+			const extCtx = ctx as ExtensionContext;
 
 			if (!daytona) {
 				const config = await loadConfig();
 				if (!config.daytonaApiKey) {
 					return {
 						content: [
-							{
-								type: "text" as const,
-								text: "Not connected to Daytona. Set daytonaApiKey in ~/.pi/daytona.json",
-							},
+							{ type: "text" as const, text: "Not connected to Daytona. Set daytonaApiKey in ~/.pi/daytona.json" },
 						],
 					};
 				}
@@ -760,22 +710,23 @@ export default async function (pi: ExtensionAPI) {
 			}
 
 			try {
-				// If no IDs given, target the active sandbox
-				const ids = sandboxIds.length > 0 ? sandboxIds : sandbox ? [sandbox.id] : [];
+				// If no IDs given, target the calling session's sandbox
+				const currentState = getState(extCtx);
+				const ids =
+					sandboxIds.length > 0
+						? sandboxIds
+						: currentState?.sandbox
+							? [currentState.sandbox.id]
+							: [];
 
 				if (ids.length === 0) {
 					return {
-						content: [
-							{
-								type: "text" as const,
-								text: "No sandboxIds provided and no sandbox is currently active.",
-							},
-						],
+						content: [{ type: "text" as const, text: "No sandboxIds provided and no sandbox is currently active for this session." }],
 					};
 				}
 
 				const results: string[] = [];
-				let detached = false;
+				let callerDetached = false;
 
 				for (const targetId of ids) {
 					try {
@@ -783,9 +734,11 @@ export default async function (pi: ExtensionAPI) {
 						let target: Sandbox | null = null;
 						for (const candidate of [targetId, prefixedName(targetId)]) {
 							try {
-								target = await daytona.get(candidate);
+								target = await daytona!.get(candidate);
 								break;
-							} catch { /* not found, try next */ }
+							} catch {
+								/* not found, try next */
+							}
 						}
 
 						if (!target) {
@@ -794,40 +747,37 @@ export default async function (pi: ExtensionAPI) {
 						}
 
 						const targetName = target.name || target.id;
-						const wasActive = sandbox?.id === target.id;
 
-						await daytona.delete(target);
-
-						if (wasActive) {
-							sandbox = null;
-							sandboxEnabled = false;
-							detached = true;
+						// Detach any sessions using this sandbox
+						for (const [sid, state] of sessions) {
+							if (state.sandbox?.id === target.id) {
+								sessions.set(sid, { ...state, enabled: false, sandbox: undefined as any });
+								if (sid === extCtx.sessionManager.getSessionId()) {
+									callerDetached = true;
+								}
+							}
 						}
 
-						results.push(`  ✓ ${targetName} (${target.id})${wasActive ? " — detached to local mode" : ""}`);
+						await daytona!.delete(target);
+
+						const detachedNote = callerDetached ? " — detached to local mode" : "";
+						results.push(`  ✓ ${targetName} (${target.id})${detachedNote}`);
 					} catch (err: any) {
 						results.push(`  ✗ ${targetId}: ${err.message}`);
 					}
 				}
 
-				if (detached) {
-					ctx.ui.setStatus("sandbox", undefined);
+				if (callerDetached) {
+					extCtx.ui.setStatus("sandbox", undefined);
 				}
 
 				return {
-					content: [
-						{
-							type: "text" as const,
-							text: `Deleted ${ids.length} sandbox(es):\n${results.join("\n")}`,
-						},
-					],
+					content: [{ type: "text" as const, text: `Deleted ${ids.length} sandbox(es):\n${results.join("\n")}` }],
 					details: { deleted: ids.length },
 				};
 			} catch (err: any) {
 				return {
-					content: [
-						{ type: "text" as const, text: `Failed to delete sandboxes: ${err.message}` },
-					],
+					content: [{ type: "text" as const, text: `Failed to delete sandboxes: ${err.message}` }],
 				};
 			}
 		},

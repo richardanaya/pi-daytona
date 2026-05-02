@@ -69,6 +69,22 @@ Sandboxes auto-stop after 30 minutes of inactivity so you won't get unexpected b
 | `daytonaApiUrl` | `https://app.daytona.io/api` | API endpoint |
 | `daytonaTarget` | `us` | Region (`us` or `eu`) |
 
+## Changelog
+
+### v0.0.1
+
+- **Per-session sandbox state**: Replaced module-level globals with a `Map<string, SessionState>` keyed
+  by `sessionManager.getSessionId()`. Each session now manages its own independent sandbox.
+- **Concurrent sessions**: Multiple pi sessions (e.g., in an HTTP server) can now use different
+  sandboxes simultaneously.
+- **session_shutdown handler**: Properly cleans up per-session state when a session is replaced or closed.
+- **sandbox-list**: Shows all active sandboxes across all sessions.
+- **sandbox-delete**: Detaches only the affected sessions instead of killing a global state.
+
+### v0.0.0
+
+- Initial release with module-level global state (single sandbox per process).
+
 ## Requirements
 
 - Node.js ≥ 18

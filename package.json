@@ -1,7 +1,7 @@
 {
   "name": "pi-daytona",
-  "version": "0.0.0",
-  "description": "A pi extension that runs tools inside a Daytona cloud sandbox for safe, isolated execution",
+  "version": "0.0.1",
+  "description": "A pi extension that runs tools inside a Daytona cloud sandbox for safe, isolated execution. v0.0.1 — per-session sandbox state supports concurrent sessions.",
   "license": "MIT",
   "author": "Richard Anaya",
   "repository": {
