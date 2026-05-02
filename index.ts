@@ -1,5 +1,5 @@
 /**
- * pi-sandbox — Daytona Cloud Sandbox Extension
+ * pi-daytona — Daytona Cloud Sandbox Extension
  *
  * Overrides pi's core filesystem and execution tools (read, write, edit,
  * bash, grep, find, ls) so all operations run inside an isolated Daytona
@@ -10,7 +10,7 @@
  *   pi --sandbox                     # create a new auto-named sandbox
  *   pi --sandbox --no-sandbox        # disable sandbox (fallback to local tools)
  *
- * Config: ~/.pi/sandbox.json
+ * Config: ~/.pi/daytona.json
  *   { "daytonaApiKey": "dtn_...", "daytonaApiUrl": "https://app.daytona.io/api" }
  */
 
@@ -48,11 +48,11 @@ interface SandboxConfig {
 
 // ── State ───────────────────────────────────────────────────────────────────
 
-const PI_SANDBOX_LABEL = { "created-by": "pi-sandbox" };
-const PI_SANDBOX_PREFIX = "pi-sandbox-";
+const PI_DAYTONA_LABEL = { "created-by": "pi-daytona" };
+const PI_DAYTONA_PREFIX = "pi-daytona-";
 
 function prefixedName(name: string): string {
-	return name.startsWith(PI_SANDBOX_PREFIX) ? name : PI_SANDBOX_PREFIX + name;
+	return name.startsWith(PI_DAYTONA_PREFIX) ? name : PI_DAYTONA_PREFIX + name;
 }
 
 function randomSuffix(): string {
@@ -293,7 +293,7 @@ function formatLsResults(
 // ── Extension ───────────────────────────────────────────────────────────────
 
 export default async function (pi: ExtensionAPI) {
-	configPath = join(homedir(), ".pi", "sandbox.json");
+	configPath = join(homedir(), ".pi", "daytona.json");
 
 	// ── Register CLI flags ───────────────────────────────────────────────
 
@@ -549,7 +549,7 @@ export default async function (pi: ExtensionAPI) {
 		if (!apiKey) {
 			sandboxEnabled = false;
 			ctx.ui.notify(
-				"Sandbox config not found. Create ~/.pi/sandbox.json with { \"daytonaApiKey\": \"dtn_...\" }",
+				"Sandbox config not found. Create ~/.pi/daytona.json with { \"daytonaApiKey\": \"dtn_...\" }",
 				"warning",
 			);
 			return;
@@ -606,7 +606,7 @@ export default async function (pi: ExtensionAPI) {
 						{
 							name,
 							language: "typescript" as any,
-							labels: PI_SANDBOX_LABEL,
+							labels: PI_DAYTONA_LABEL,
 						},
 						{ timeout: 120 },
 					);
@@ -617,14 +617,14 @@ export default async function (pi: ExtensionAPI) {
 				}
 			} else {
 				// --sandbox passed without a value and no config fallback → auto-create
-				const name = PI_SANDBOX_PREFIX + randomSuffix();
+				const name = PI_DAYTONA_PREFIX + randomSuffix();
 				ctx.ui.notify(`Creating Daytona sandbox "${name}"...`, "info");
 				sandbox = await daytona.create(
 					{
 						name,
 						language: "typescript" as any,
 						autoStopInterval: 30,
-						labels: PI_SANDBOX_LABEL,
+						labels: PI_DAYTONA_LABEL,
 					},
 					{ timeout: 120 },
 				);
@@ -676,7 +676,7 @@ export default async function (pi: ExtensionAPI) {
 						content: [
 							{
 								type: "text" as const,
-								text: "Not connected to Daytona. Set daytonaApiKey in ~/.pi/sandbox.json",
+								text: "Not connected to Daytona. Set daytonaApiKey in ~/.pi/daytona.json",
 							},
 						],
 					};
@@ -689,7 +689,7 @@ export default async function (pi: ExtensionAPI) {
 			}
 
 			try {
-				const result = await daytona.list(PI_SANDBOX_LABEL);
+				const result = await daytona.list(PI_DAYTONA_LABEL);
 				if (result.items.length === 0) {
 					return {
 						content: [{ type: "text" as const, text: "No pi-managed sandboxes found." }],
@@ -747,7 +747,7 @@ export default async function (pi: ExtensionAPI) {
 						content: [
 							{
 								type: "text" as const,
-								text: "Not connected to Daytona. Set daytonaApiKey in ~/.pi/sandbox.json",
+								text: "Not connected to Daytona. Set daytonaApiKey in ~/.pi/daytona.json",
 							},
 						],
 					};

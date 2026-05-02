@@ -1,24 +1,24 @@
 {
-  "name": "pi-sandbox",
+  "name": "pi-daytona",
   "version": "0.0.0",
   "description": "A pi extension that runs tools inside a Daytona cloud sandbox for safe, isolated execution",
   "license": "MIT",
   "author": "Richard Anaya",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/richardanaya/pi-sandbox.git"
+    "url": "git+https://github.com/richardanaya/pi-daytona.git"
   },
   "bugs": {
-    "url": "https://github.com/richardanaya/pi-sandbox/issues"
+    "url": "https://github.com/richardanaya/pi-daytona/issues"
   },
-  "homepage": "https://github.com/richardanaya/pi-sandbox#readme",
+  "homepage": "https://github.com/richardanaya/pi-daytona#readme",
   "type": "module",
   "main": "index.ts",
   "types": "index.ts",
   "files": [
     "index.ts",
     "README.md",
-    "sandbox.example.json"
+    "daytona.example.json"
   ],
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",

@@ -1,4 +1,4 @@
-# pi-sandbox
+# pi-daytona
 
 Run pi safely inside a [Daytona](https://daytona.io) cloud sandbox. Every file read, write, shell command, and search runs in an isolated container — your local machine is never touched.
 
@@ -14,7 +14,7 @@ Sign up at [daytona.io](https://daytona.io) and grab an API key from the dashboa
 
 **2. Configure pi**
 
-Create `~/.pi/sandbox.json`:
+Create `~/.pi/daytona.json`:
 
 ```json
 {
@@ -25,7 +25,7 @@ Create `~/.pi/sandbox.json`:
 **3. Install**
 
 ```bash
-pi install npm:pi-sandbox
+pi install npm:pi-daytona
 ```
 
 ## Usage
