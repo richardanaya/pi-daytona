@@ -1,11 +1,12 @@
 /**
- * pi-daytona — Daytona Cloud Sandbox Extension (v0.0.1)
+ * pi-daytona — Daytona Cloud Sandbox Extension (v0.0.2)
  *
  * Overrides pi's core filesystem and execution tools (read, write, edit,
  * bash, grep, find, ls) so all operations run inside an isolated Daytona
  * sandbox instead of the local machine.
  *
- * v0.0.1: Per-session sandbox state — supports concurrent sessions
+ * v0.0.2: Per-session sandbox state — supports concurrent sessions;
+ *          skill files (SKILL.md) read from local filesystem first.
  * (e.g., HTTP server with multiple clients) by keying sandbox state
  * on sessionManager.getSessionId() instead of module globals.
  *
@@ -123,6 +124,21 @@ function toSandboxPath(state: SessionState, absolutePath: string): string {
 }
 
 // ── Sandbox Operations Factories (per-session) ──────────────────────────────
+
+/** Check if a read path is a skill file (SKILL.md). */
+function isSkillFile(path: string): boolean {
+	return path.endsWith("SKILL.md");
+}
+
+/** Try reading a file from the local filesystem first. */
+async function tryLocalRead(absolutePath: string): Promise<Buffer | null> {
+	try {
+		const content = await readFile(absolutePath);
+		return content;
+	} catch {
+		return null;
+	}
+}
 
 function createSandboxReadOps(state: SessionState): ReadOperations {
 	const s = state.sandbox;
@@ -294,6 +310,15 @@ export default async function (pi: ExtensionAPI) {
 			if (!state?.enabled || !state.sandbox) {
 				return localRead.execute(id, params, signal, onUpdate);
 			}
+
+			const readParams = params as { path: string; offset?: number; limit?: number };
+			if (isSkillFile(readParams.path)) {
+				const localContent = await tryLocalRead(readParams.path);
+				if (localContent !== null) {
+					return localRead.execute(id, params, signal, onUpdate);
+				}
+			}
+
 			return buildReadTool(state).execute(id, params, signal, onUpdate);
 		},
 	});
